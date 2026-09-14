@@ -1,0 +1,17 @@
+# artefatti di compilazione
+OutlookAdFix.dll
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# SDK WebView2 scaricato da build/get-sdk.ps1
+build/sdk/
+
+# file sostituiti, tenuti solo in locale
+legacy/
+
+# sistema
+Thumbs.db
+desktop.ini
