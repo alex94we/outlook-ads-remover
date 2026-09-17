@@ -1,7 +1,11 @@
 // OutlookAdFix - provider AppVerifier per olk.exe
-// 1) aggancia CreateCoreWebView2EnvironmentWithOptions (IAT di nh.dll)
+// 1) aggancia CreateCoreWebView2EnvironmentWithOptions (IAT di tutti i moduli + EAT di WebView2Loader.dll)
 // 2) incatena i vtable degli handler WebView2 fino al controller
 // 3) inietta il payload JS/CSS letto da %LOCALAPPDATA%\Remove-OutlookAds\inject.js
+//
+// Nota sulla tempistica: la nuova app Outlook crea l'ambiente WebView2 circa 100-150 ms
+// dopo l'avvio del processo, quindi il polling dell'import deve essere molto fitto nei
+// primi millisecondi, altrimenti la chiamata passa prima della patch (race condition).
 #include <windows.h>
 #include <tlhelp32.h>
 #include <wrl.h>
@@ -18,8 +22,14 @@ static void LogLine(const wchar_t* text) {
     HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t pref[80];
+    swprintf_s(pref, 80, L"[%02d:%02d:%02d.%03d pid=%lu] ",
+               st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, GetCurrentProcessId());
     DWORD written = 0;
     SetFilePointer(h, 0, NULL, FILE_END);
+    WriteFile(h, pref, (DWORD)(lstrlenW(pref) * sizeof(wchar_t)), &written, NULL);
     WriteFile(h, text, (DWORD)(lstrlenW(text) * sizeof(wchar_t)), &written, NULL);
     WriteFile(h, L"\r\n", 4, &written, NULL);
     CloseHandle(h);
@@ -51,7 +61,7 @@ static std::wstring LoadPayload(void) {
     return out;
 }
 
-// ------------------------------------------------------------------ IAT
+// ------------------------------------------------------------------ PE helpers
 static bool PatchIAT(HMODULE hMod, const char* libName, const char* funcName, void* newFunc, void** oldFunc) {
     if (!hMod) return false;
     BYTE* base = (BYTE*)hMod;
@@ -79,6 +89,32 @@ static bool PatchIAT(HMODULE hMod, const char* libName, const char* funcName, vo
             VirtualProtect(&ft->u1.Function, sizeof(void*), oldProt, &oldProt);
             return true;
         }
+    }
+    return false;
+}
+
+static bool PatchEAT(HMODULE hMod, const char* funcName, void* newFunc, void** oldFunc) {
+    if (!hMod) return false;
+    BYTE* base = (BYTE*)hMod;
+    IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    IMAGE_NT_HEADERS* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (!rva) return false;
+    IMAGE_EXPORT_DIRECTORY* exp = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(base + rva);
+    DWORD* names = reinterpret_cast<DWORD*>(base + exp->AddressOfNames);
+    WORD* ords = reinterpret_cast<WORD*>(base + exp->AddressOfNameOrdinals);
+    DWORD* funcs = reinterpret_cast<DWORD*>(base + exp->AddressOfFunctions);
+    for (DWORD i = 0; i < exp->NumberOfNames; i++) {
+        const char* n = (const char*)(base + names[i]);
+        if (strcmp(n, funcName) != 0) continue;
+        DWORD* entry = &funcs[ords[i]];
+        DWORD oldProt = 0;
+        if (!VirtualProtect(entry, sizeof(DWORD), PAGE_READWRITE, &oldProt)) return false;
+        if (oldFunc && !*oldFunc) *oldFunc = (void*)(base + *entry);
+        *entry = (DWORD)((BYTE*)newFunc - base);
+        VirtualProtect(entry, sizeof(DWORD), oldProt, &oldProt);
+        return true;
     }
     return false;
 }
@@ -164,7 +200,7 @@ static HRESULT STDAPICALLTYPE Hook_CreateEnv(PCWSTR browserFolder, PCWSTR userDa
     return g_origCreateEnv(browserFolder, userDataFolder, options, handler);
 }
 
-// ------------------------------------------------------------------ thread
+// ------------------------------------------------------------------ patch di tutti i moduli
 static bool PatchAllModules(void) {
     bool any = false;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -176,7 +212,17 @@ static bool PatchAllModules(void) {
         do {
             if (PatchIAT(me.hModule, "WebView2Loader.dll", "CreateCoreWebView2EnvironmentWithOptions",
                          (void*)Hook_CreateEnv, (void**)&g_origCreateEnv)) {
+                wchar_t msg[256];
+                swprintf_s(msg, 256, L"IAT agganciata nel modulo %s", me.szModule);
+                LogLine(msg);
                 any = true;
+            }
+            if (_wcsicmp(me.szModule, L"WebView2Loader.dll") == 0) {
+                if (PatchEAT(me.hModule, "CreateCoreWebView2EnvironmentWithOptions",
+                             (void*)Hook_CreateEnv, (void**)&g_origCreateEnv)) {
+                    LogLine(L"EAT di WebView2Loader.dll agganciata");
+                    any = true;
+                }
             }
         } while (Module32NextW(snap, &me));
     }
@@ -185,11 +231,17 @@ static bool PatchAllModules(void) {
 }
 
 static DWORD WINAPI Worker(LPVOID) {
-    for (int i = 0; i < 240; i++) {
-        if (PatchAllModules()) {
-            LogLine(L"IAT agganciata (CreateCoreWebView2EnvironmentWithOptions)");
-            return 0;
-        }
+    // La app crea WebView2 circa 100-150 ms dopo l'avvio: serve un polling fittissimo subito.
+    for (int i = 0; i < 400; i++) {
+        if (PatchAllModules()) { LogLine(L"fase 1 (1 ms) completata"); return 0; }
+        Sleep(1);
+    }
+    for (int i = 0; i < 200; i++) {
+        if (PatchAllModules()) { LogLine(L"fase 2 (20 ms) completata"); return 0; }
+        Sleep(20);
+    }
+    for (int i = 0; i < 60; i++) {
+        if (PatchAllModules()) { LogLine(L"fase 3 (250 ms) completata"); return 0; }
         Sleep(250);
     }
     LogLine(L"IAT NON agganciata: import non trovato");

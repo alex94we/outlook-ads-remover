@@ -1,11 +1,10 @@
 /* Outlook Ad Remover - payload iniettato nel WebView2 della nuova app Outlook.
    Nasconde le righe pubblicitarie dell'elenco messaggi.
 
-   Regola primaria: la riga annuncio ha la classe "iIsOF" (verificato sulla
-   versione 1.2026.902.100: compare solo sulle righe annuncio).
-   Ripiego strutturale: se la classe cambia con un aggiornamento di Outlook,
-   nasconde l'antenato dell'etichetta "Annuncio" che si trova allo stesso
-   livello delle righe vere dell'elenco (div[role="listitem"]). */
+   Regola primaria: la riga annuncio ha la classe "iIsOF".
+   Ripiego strutturale: se la classe cambia con un aggiornamento, nasconde
+   l'antenato dell'etichetta "Annuncio" che si trova allo stesso livello delle
+   righe vere dell'elenco (div[role="listitem"]). */
 (function () {
   'use strict';
   try {
@@ -45,7 +44,6 @@
       return t.length > 0 && t.length <= 30 && LABELS.indexOf(t) !== -1;
     }
 
-    // risale dall'etichetta solo fino al livello che contiene righe vere
     function rowFromLabel(el) {
       var cur = el, depth = 0;
       while (cur && cur.parentElement && depth < 15) {
