@@ -82,6 +82,7 @@ static bool PatchIAT(HMODULE hMod, const char* libName, const char* funcName, vo
             if (oft->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
             IMAGE_IMPORT_BY_NAME* ibn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + oft->u1.AddressOfData);
             if (strcmp((const char*)ibn->Name, funcName) != 0) continue;
+            if ((void*)ft->u1.Function == newFunc) return false;
             DWORD oldProt = 0;
             if (!VirtualProtect(&ft->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProt)) return false;
             if (oldFunc && !*oldFunc) *oldFunc = (void*)ft->u1.Function;
@@ -109,12 +110,44 @@ static bool PatchEAT(HMODULE hMod, const char* funcName, void* newFunc, void** o
         const char* n = (const char*)(base + names[i]);
         if (strcmp(n, funcName) != 0) continue;
         DWORD* entry = &funcs[ords[i]];
+        if ((void*)(base + *entry) == newFunc) return false;
         DWORD oldProt = 0;
         if (!VirtualProtect(entry, sizeof(DWORD), PAGE_READWRITE, &oldProt)) return false;
         if (oldFunc && !*oldFunc) *oldFunc = (void*)(base + *entry);
         *entry = (DWORD)((BYTE*)newFunc - base);
         VirtualProtect(entry, sizeof(DWORD), oldProt, &oldProt);
         return true;
+    }
+    return false;
+}
+
+static bool PatchDelayIAT(HMODULE hMod, const char* libName, const char* funcName, void* newFunc, void** oldFunc) {
+    if (!hMod) return false;
+    BYTE* base = (BYTE*)hMod;
+    IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    IMAGE_NT_HEADERS* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress;
+    if (!rva) return false;
+    IMAGE_DELAYLOAD_DESCRIPTOR* d = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(base + rva);
+    for (; d->DllNameRVA; ++d) {
+        if (!d->Attributes.RvaBased) continue;
+        const char* dll = (const char*)(base + d->DllNameRVA);
+        if (_stricmp(dll, libName) != 0) continue;
+        IMAGE_THUNK_DATA* int_ = reinterpret_cast<IMAGE_THUNK_DATA*>(base + d->ImportNameTableRVA);
+        IMAGE_THUNK_DATA* iat = reinterpret_cast<IMAGE_THUNK_DATA*>(base + d->ImportAddressTableRVA);
+        for (; int_->u1.Function; ++int_, ++iat) {
+            if (int_->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
+            IMAGE_IMPORT_BY_NAME* ibn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + int_->u1.AddressOfData);
+            if (strcmp((const char*)ibn->Name, funcName) != 0) continue;
+            if ((void*)iat->u1.Function == newFunc) return false;
+            DWORD oldProt = 0;
+            if (!VirtualProtect(&iat->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProt)) return false;
+            if (oldFunc && !*oldFunc) *oldFunc = (void*)iat->u1.Function;
+            iat->u1.Function = (ULONG_PTR)newFunc;
+            VirtualProtect(&iat->u1.Function, sizeof(void*), oldProt, &oldProt);
+            return true;
+        }
     }
     return false;
 }
@@ -201,7 +234,21 @@ static HRESULT STDAPICALLTYPE Hook_CreateEnv(PCWSTR browserFolder, PCWSTR userDa
 }
 
 // ------------------------------------------------------------------ patch di tutti i moduli
+// L'originale va risolto PRIMA di toccare la tabella export, altrimenti GetProcAddress
+// restituirebbe il nostro hook e la chiamata girerebbe all'infinito.
+static bool EnsureOriginal(void) {
+    if (g_origCreateEnv) return true;
+    HMODULE h = GetModuleHandleW(L"WebView2Loader.dll");
+    if (!h) h = LoadLibraryW(L"WebView2Loader.dll");
+    if (!h) return false;
+    g_origCreateEnv = (PFN_CreateEnv)GetProcAddress(h, "CreateCoreWebView2EnvironmentWithOptions");
+    if (g_origCreateEnv) { LogLine(L"funzione originale risolta"); return true; }
+    return false;
+}
+
 static bool PatchAllModules(void) {
+    if (!EnsureOriginal()) return false;
+
     bool any = false;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) return false;
@@ -217,9 +264,16 @@ static bool PatchAllModules(void) {
                 LogLine(msg);
                 any = true;
             }
+            if (PatchDelayIAT(me.hModule, "WebView2Loader.dll", "CreateCoreWebView2EnvironmentWithOptions",
+                              (void*)Hook_CreateEnv, NULL)) {
+                wchar_t msg[256];
+                swprintf_s(msg, 256, L"delay-IAT agganciata nel modulo %s", me.szModule);
+                LogLine(msg);
+                any = true;
+            }
             if (_wcsicmp(me.szModule, L"WebView2Loader.dll") == 0) {
                 if (PatchEAT(me.hModule, "CreateCoreWebView2EnvironmentWithOptions",
-                             (void*)Hook_CreateEnv, (void**)&g_origCreateEnv)) {
+                             (void*)Hook_CreateEnv, NULL)) {
                     LogLine(L"EAT di WebView2Loader.dll agganciata");
                     any = true;
                 }
@@ -231,20 +285,12 @@ static bool PatchAllModules(void) {
 }
 
 static DWORD WINAPI Worker(LPVOID) {
-    // La app crea WebView2 circa 100-150 ms dopo l'avvio: serve un polling fittissimo subito.
-    for (int i = 0; i < 400; i++) {
-        if (PatchAllModules()) { LogLine(L"fase 1 (1 ms) completata"); return 0; }
-        Sleep(1);
-    }
-    for (int i = 0; i < 200; i++) {
-        if (PatchAllModules()) { LogLine(L"fase 2 (20 ms) completata"); return 0; }
-        Sleep(20);
-    }
-    for (int i = 0; i < 60; i++) {
-        if (PatchAllModules()) { LogLine(L"fase 3 (250 ms) completata"); return 0; }
-        Sleep(250);
-    }
-    LogLine(L"IAT NON agganciata: import non trovato");
+    // L'app puo' caricare WebView2Loader.dll piu' tardi (delay load) e risolvere la
+    // funzione in un secondo momento: il monitoraggio non deve fermarsi presto.
+    for (int i = 0; i < 400; i++) { PatchAllModules(); Sleep(1); }
+    for (int i = 0; i < 700; i++) { PatchAllModules(); Sleep(20); }
+    for (int i = 0; i < 1200; i++) { PatchAllModules(); Sleep(500); }
+    LogLine(L"monitoraggio terminato");
     return 0;
 }
 
